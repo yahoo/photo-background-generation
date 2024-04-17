@@ -1,0 +1,10 @@
+accelerate==0.28.0
+transformers==4.39.3
+pyarrow==15.0.2
+ftfy==6.2.0
+tensorboard==2.14.0
+datasets==2.18.0
+torchvision==0.17.2
+jupyterlab==4.1.6
+diffusers==0.27.2
+transparent-background==1.2.12
