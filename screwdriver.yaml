@@ -1,0 +1,16 @@
+jobs:
+  validate-semgrep-sast:
+    template: ProdSec/validate_semgrep@stable
+    image: alma8
+    environment:
+      YAHOO_SEMGREP_ENFORCING: False #(If you choose to fail builds for validation failures in Semgrep, then you should set this value to True)
+      YAHOO_SEMGREP_ONLINE: True
+
+  checkov:
+    requires: [~pr, ~commit]
+    image: docker.ouroath.com:4443/containers/python3:latest
+    steps:
+      - run: |
+          sd-cmd exec ProdSec/checkov@stable -d $SD_SOURCE_DIR
+    environment:
+      CHECKOV_HARD_FAIL_ON_FINDINGS: false
