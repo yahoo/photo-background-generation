@@ -1,4 +1,4 @@
-# Salient Object Aware Background Generation [![Paper](assets/arxiv.svg)](https://arxiv.org/pdf/2404.10157.pdf)
+# Salient Object Aware Background Generation [![Paper](assets/arxiv.svg)](https://arxiv.org/pdf/2404.10157.pdf) [![Model](assets/huggingface.svg)](https://huggingface.co/yahoo-inc/photo-background-generation)
 This repository accompanies our paper, [Salient Object-Aware Background Generation using Text-Guided Diffusion Models](https://arxiv.org/abs/2404.10157), which has been accepted for publication in [CVPR 2024 Generative Models for Computer Vision](https://generative-vision.github.io/workshop-CVPR-24/) workshop.
 
 The paper addresses an issue we call "object expansion" when generating backgrounds for salient objects using inpainting diffusion models.  We show that models such as [Stable Inpainting](https://huggingface.co/stabilityai/stable-diffusion-2-inpainting) can sometimes arbitrarily expand or distort the salient object, which is undesirable in applications where the object's identity should be preserved, such as e-commerce ads. We provide some examples of object expansion as follows:
