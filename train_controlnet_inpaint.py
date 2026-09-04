@@ -21,13 +21,12 @@ import os
 import random
 import shutil
 from pathlib import Path
-import cv2
-from PIL import Image, ImageOps
+
 import accelerate
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
@@ -35,7 +34,7 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
-from PIL import Image
+from PIL import Image, ImageOps
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer, PretrainedConfig
@@ -52,7 +51,6 @@ from diffusers import (
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
-
 
 if is_wandb_available():
     import wandb
@@ -72,6 +70,22 @@ def image_grid(imgs, rows, cols):
     for i, img in enumerate(imgs):
         grid.paste(img, box=(i % cols * w, i // cols * h))
     return grid
+
+
+def resize_with_padding(img, expected_size):
+    """Downscale `img` to fit `expected_size` and pad it to exactly that size.
+
+    Works on a copy: Image.thumbnail mutates in place, and callers pass images
+    they still hold references to.
+    """
+    img = img.copy()
+    img.thumbnail((expected_size[0], expected_size[1]))
+    delta_width = expected_size[0] - img.size[0]
+    delta_height = expected_size[1] - img.size[1]
+    pad_width = delta_width // 2
+    pad_height = delta_height // 2
+    padding = (pad_width, pad_height, delta_width - pad_width, delta_height - pad_height)
+    return ImageOps.expand(img, padding)
 
 
 def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step):
@@ -102,38 +116,58 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
     else:
         generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
 
-    if len(args.validation_image) == len(args.validation_prompt):
+    # parse_args guarantees the three lists are either equal length or
+    # broadcastable from a single element, so this only has to fan them out.
+    num_prompts = len(args.validation_prompt)
+    num_images = len(args.validation_image)
+    if num_images == num_prompts:
         validation_images = args.validation_image
-        validation_inpainting_images = args.validation_inpainting_image
         validation_prompts = args.validation_prompt
-    elif len(args.validation_image) == 1:
-        validation_images = args.validation_image * len(args.validation_prompt)
-        validation_inpainting_images = args.validation_inpainting_image * len(args.validation_prompt)
+    elif num_images == 1:
+        validation_images = args.validation_image * num_prompts
         validation_prompts = args.validation_prompt
-    elif len(args.validation_prompt) == 1:
+    elif num_prompts == 1:
         validation_images = args.validation_image
-        validation_inpainting_images = args.validation_inpainting_image
-        validation_prompts = args.validation_prompt * len(args.validation_image)
+        validation_prompts = args.validation_prompt * num_images
     else:
         raise ValueError(
             "number of `args.validation_image` and `args.validation_prompt` should be checked in `parse_args`"
         )
 
+    # Broadcast the inpainting images independently: they may legitimately be a
+    # single shared image even when the other two lists are longer.
+    target_len = len(validation_prompts)
+    if len(args.validation_inpainting_image) == target_len:
+        validation_inpainting_images = args.validation_inpainting_image
+    elif len(args.validation_inpainting_image) == 1:
+        validation_inpainting_images = args.validation_inpainting_image * target_len
+    else:
+        raise ValueError(
+            "number of `args.validation_inpainting_image` should be checked in `parse_args`"
+        )
+
     image_logs = []
+    validation_size = (args.resolution, args.resolution)
+    autocast_device = accelerator.device.type
 
-    for validation_prompt, validation_image, validation_inpainting_image in zip(validation_prompts, validation_images, validation_inpainting_images):
+    for validation_prompt, validation_image, validation_inpainting_image in zip(
+        validation_prompts, validation_images, validation_inpainting_images
+    ):
         mask = Image.open(validation_image)
-        mask = resize_with_padding(mask, (512,512))
+        mask = resize_with_padding(mask, validation_size)
 
-        inpainting_image  = Image.open(validation_inpainting_image).convert("RGB")
-        inpainting_image = resize_with_padding(inpainting_image, (512,512))
+        inpainting_image = Image.open(validation_inpainting_image).convert("RGB")
+        inpainting_image = resize_with_padding(inpainting_image, validation_size)
 
-        validation_image = Image.composite(inpainting_image, mask, mask.convert('L')).convert('RGB')
+        validation_image = Image.composite(inpainting_image, mask, mask.convert("L")).convert("RGB")
         images = []
         for _ in range(args.num_validation_images):
-            with torch.autocast("cuda"):
+            with torch.autocast(autocast_device):
                 image = pipeline(
-                    validation_prompt, validation_image, num_inference_steps=20, generator=generator
+                    validation_prompt,
+                    validation_image,
+                    num_inference_steps=args.validation_inference_steps,
+                    generator=generator,
                 ).images[0]
             images.append(image)
 
@@ -148,10 +182,7 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
                 validation_prompt = log["validation_prompt"]
                 validation_image = log["validation_image"]
 
-                formatted_images = []
-
-                formatted_images.append(np.asarray(validation_image))
-
+                formatted_images = [np.asarray(validation_image)]
                 for image in images:
                     formatted_images.append(np.asarray(image))
                 formatted_images = np.stack(formatted_images)
@@ -168,14 +199,15 @@ def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, acceler
                 formatted_images.append(wandb.Image(validation_image, caption="Controlnet conditioning"))
 
                 for image in images:
-                    image = wandb.Image(image, caption=validation_prompt)
-                    formatted_images.append(image)
+                    formatted_images.append(wandb.Image(image, caption=validation_prompt))
 
             tracker.log({"validation": formatted_images})
         else:
-            logger.warn(f"image logging not implemented for {tracker.name}")
+            logger.warning(f"image logging not implemented for {tracker.name}")
 
-        return image_logs
+    # Outside the loop: every configured tracker must be written before
+    # returning. Previously this returned after the first tracker.
+    return image_logs
 
 
 def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
@@ -198,7 +230,7 @@ def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: st
         raise ValueError(f"{model_class} is not supported.")
 
 
-def save_model_card(repo_id: str, image_logs=None, base_model=str, repo_folder=None):
+def save_model_card(repo_id: str, base_model: str, repo_folder: str, image_logs=None):
     img_str = ""
     if image_logs is not None:
         img_str = "You can find some example images below.\n"
@@ -285,8 +317,17 @@ def parse_args(input_args=None):
         type=int,
         default=512,
         help=(
-            "The resolution for input images, all the images in the train/validation dataset will be resized to this"
-            " resolution"
+            "The resolution for input images. Training images are randomly cropped to this size and validation"
+            " images are letterboxed to it."
+        ),
+    )
+    parser.add_argument(
+        "--crop_short_side",
+        type=int,
+        default=768,
+        help=(
+            "Short side, in pixels, that training images are resized to before the random crop to --resolution."
+            " Must be >= --resolution. Larger values give the random crop more freedom."
         ),
     )
     parser.add_argument(
@@ -526,10 +567,8 @@ def parse_args(input_args=None):
         default=None,
         nargs="+",
         help=(
-            "A set of paths to the controlnet conditioning image be evaluated every `--validation_steps`"
-            " and logged to `--report_to`. Provide either a matching number of `--validation_prompt`s, a"
-            " a single `--validation_prompt` to be used with all `--validation_image`s, or a single"
-            " `--validation_image` that will be used with all `--validation_prompt`s."
+            "A set of paths to the images that are composited under the conditioning mask during validation."
+            " Provide either one per validation pair, or exactly one to be reused for every pair."
         ),
     )
     parser.add_argument(
@@ -537,6 +576,12 @@ def parse_args(input_args=None):
         type=int,
         default=4,
         help="Number of images to be generated for each `--validation_image`, `--validation_prompt` pair",
+    )
+    parser.add_argument(
+        "--validation_inference_steps",
+        type=int,
+        default=20,
+        help="Number of denoising steps used when generating validation images.",
     )
     parser.add_argument(
         "--validation_steps",
@@ -590,9 +635,34 @@ def parse_args(input_args=None):
             " or the same number of `--validation_prompt`s and `--validation_image`s"
         )
 
+    # The inpainting list was previously accepted without any check, then fanned
+    # out in log_validation on the assumption that it matched. A mismatch
+    # silently paired the wrong mask with the wrong prompt.
+    if args.validation_prompt is not None and args.validation_inpainting_image is None:
+        raise ValueError("`--validation_inpainting_image` must be set if `--validation_prompt` is set")
+
+    if args.validation_inpainting_image is not None and args.validation_prompt is None:
+        raise ValueError("`--validation_prompt` must be set if `--validation_inpainting_image` is set")
+
+    if args.validation_inpainting_image is not None:
+        expected_pairs = max(len(args.validation_image), len(args.validation_prompt))
+        if len(args.validation_inpainting_image) not in (1, expected_pairs):
+            raise ValueError(
+                "Must provide either 1 `--validation_inpainting_image` or exactly"
+                f" {expected_pairs} of them to match the validation pairs"
+            )
+
     if args.resolution % 8 != 0:
         raise ValueError(
             "`--resolution` must be divisible by 8 for consistently sized encoded images between the VAE and the controlnet encoder."
+        )
+
+    # Previously 512 and 768 were hardcoded, so this could not be violated.
+    # Now that both are configurable, an inverted pair would fail deep inside
+    # the dataloader with an opaque numpy error.
+    if args.crop_short_side < args.resolution:
+        raise ValueError(
+            f"`--crop_short_side` ({args.crop_short_side}) must be >= `--resolution` ({args.resolution})"
         )
 
     return args
@@ -611,14 +681,17 @@ def make_train_dataset(args, tokenizer, accelerator):
             args.dataset_config_name,
             cache_dir=args.cache_dir,
         )
-    else:
-        if args.train_data_dir is not None:
-            dataset = load_dataset(
-                args.train_data_dir,
-                cache_dir=args.cache_dir,
-            )
+    elif args.train_data_dir is not None:
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
+        dataset = load_dataset(
+            args.train_data_dir,
+            cache_dir=args.cache_dir,
+        )
+    else:
+        # parse_args already rejects this, but leaving `dataset` unbound here
+        # would surface as a confusing NameError instead.
+        raise ValueError("Specify either `--dataset_name` or `--train_data_dir`")
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
@@ -674,26 +747,12 @@ def make_train_dataset(args, tokenizer, accelerator):
         )
         return inputs.input_ids
 
-    image_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
-
-    conditioning_image_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution),
-            transforms.ToTensor(),
-        ]
-    )
-
+    # NOTE: images are deliberately passed through as PIL here. All resizing,
+    # cropping and tensor conversion happens in the collate function so that the
+    # image and its conditioning mask receive an identical random crop.
     def preprocess_train(examples):
-        examples["pixel_values"] = examples[image_column] #images
-        examples["conditioning_pixel_values"] =  examples[conditioning_image_column] #conditioning_images
+        examples["pixel_values"] = examples[image_column]
+        examples["conditioning_pixel_values"] = examples[conditioning_image_column]
         examples["input_ids"] = tokenize_captions(examples)
 
         return examples
@@ -707,71 +766,48 @@ def make_train_dataset(args, tokenizer, accelerator):
     return train_dataset
 
 
-def resize_with_padding(img, expected_size):
-    img.thumbnail((expected_size[0], expected_size[1]))
-    # print(img.size)
-    delta_width = expected_size[0] - img.size[0]
-    delta_height = expected_size[1] - img.size[1]
-    pad_width = delta_width // 2
-    pad_height = delta_height // 2
-    padding = (pad_width, pad_height, delta_width - pad_width, delta_height - pad_height)
-    return ImageOps.expand(img, padding)
+def _resize_short_side(image, short_side):
+    """Resize a HWC array so its shorter side is exactly `short_side`.
 
-def prepare_mask_and_masked_image(image, mask):
-    image = np.array(image.convert("RGB"))
-    image = image[None].transpose(0, 3, 1, 2)
-    image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0
+    numpy shape is (height, width); cv2.resize takes (width, height). The
+    original code encoded that inversion as `1 - argmin(...)` index arithmetic
+    with no explanation. Spelling it out costs two lines and removes the trap.
+    """
+    height, width = image.shape[:2]
+    scale = short_side / float(min(height, width))
 
-    mask = np.array(mask.convert("L"))
-    mask = mask.astype(np.float32) / 255.0
-    mask = mask[None, None]
-    mask[mask < 0.5] = 0
-    mask[mask >= 0.5] = 1
+    if height <= width:
+        new_height = short_side
+        new_width = int(round(width * scale))
+    else:
+        new_width = short_side
+        new_height = int(round(height * scale))
 
-    masked_image = image * (mask < 0.5)
-
-    return mask, masked_image
-
-def collate_fn(examples):
-    pixel_values = [example["pixel_values"].convert("RGB") for example in examples]
-    conditioning_images = [example["conditioning_pixel_values"].convert("RGB") for example in examples]
-    masks = []
-    masked_images = []
-
-    # Resize and random crop images
-    for i in range(len(pixel_values)):
-        image = np.array(pixel_values[i])
-        mask = np.array(conditioning_images[i])
-        dim_min_ind = np.argmin(image.shape[0:2])
-        dim = [0, 0]
-
-        resize_len = 768.0
-        ratio = resize_len / image.shape[0:2][dim_min_ind]
-        dim[1-dim_min_ind] = int(resize_len)
-        dim[dim_min_ind] = int(ratio * image.shape[0:2][1-dim_min_ind])
-        dim = tuple(dim)
-
-        # resize image
-        image = cv2.resize(image, dim, interpolation = cv2.INTER_AREA)
-        mask = cv2.resize(mask, dim, interpolation = cv2.INTER_AREA)
-        max_x = image.shape[1] - 512
-        max_y = image.shape[0] - 512
-        x = np.random.randint(0, max_x)
-        y = np.random.randint(0, max_y)
-        image = image[y: y + 512, x: x + 512]
-        mask = mask[y: y + 512, x: x + 512]
-
-        # fix for bluish outputs
-        r = np.copy(image[:,:,0])
-        image[:,:,0] = image[:,:,2]
-        image[:,:,2] = r
-        image = Image.fromarray(image)
-        b, g, r = image.split()
-        image = Image.merge("RGB", (r, g, b))
-        pixel_values[i] = image
-        conditioning_images[i] = Image.composite(image, Image.fromarray(mask), Image.fromarray(mask).convert('L')).convert('RGB')
+    return cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
 
 
+def _random_crop_origin(extent, crop_size):
+    """Pick a crop origin in [0, extent - crop_size], inclusive.
+
+    The original used np.random.randint(0, extent - crop_size), which excludes
+    the upper bound (so the far edge was never reachable) and raises when the
+    resized image is exactly `crop_size` wide.
+    """
+    span = extent - crop_size
+    if span <= 0:
+        return 0
+    return int(np.random.randint(0, span + 1))
+
+
+def build_collate_fn(args):
+    """Build the collate function, closing over `args` explicitly.
+
+    The original `collate_fn` referenced a module-level `args` that only existed
+    because it was assigned under `if __name__ == "__main__"`. Importing this
+    module and using the function raised NameError.
+
+    The transforms are also built once here rather than rebuilt for every batch.
+    """
     image_transforms = transforms.Compose(
         [
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -786,25 +822,59 @@ def collate_fn(examples):
             transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(args.resolution),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5])
+            transforms.Normalize([0.5], [0.5]),
         ]
     )
 
-    pixel_values = [image_transforms(image) for image in pixel_values]
-    pixel_values = torch.stack(pixel_values)
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    crop_size = args.resolution
+    short_side = args.crop_short_side
 
-    conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
-    conditioning_pixel_values = torch.stack(conditioning_images)
-    conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
+    def collate_fn(examples):
+        pixel_values = [example["pixel_values"].convert("RGB") for example in examples]
+        conditioning_images = [example["conditioning_pixel_values"].convert("RGB") for example in examples]
 
-    input_ids = torch.stack([example["input_ids"] for example in examples])
-    
-    return {
-        "pixel_values": pixel_values,
-        "conditioning_pixel_values": conditioning_pixel_values,
-        "input_ids": input_ids,
-    }
+        for i in range(len(pixel_values)):
+            image = np.array(pixel_values[i])
+            mask = np.array(conditioning_images[i])
+
+            # Resize both to a common scale, then take the SAME random crop from
+            # each so the mask stays registered to the image.
+            image = _resize_short_side(image, short_side)
+            mask = _resize_short_side(mask, short_side)
+
+            y = _random_crop_origin(image.shape[0], crop_size)
+            x = _random_crop_origin(image.shape[1], crop_size)
+            image = image[y : y + crop_size, x : x + crop_size]
+            mask = mask[y : y + crop_size, x : x + crop_size]
+
+            # NOTE: the original applied an R/B swap with numpy and then a
+            # second one via PIL split/merge under the comment "fix for bluish
+            # outputs". Two swaps compose to the identity, so the block was a
+            # no-op and has been removed. PIL -> np.array -> cv2.resize all
+            # preserve RGB ordering, so no swap is needed here.
+            image = Image.fromarray(image)
+            mask = Image.fromarray(mask)
+
+            pixel_values[i] = image
+            conditioning_images[i] = Image.composite(image, mask, mask.convert("L")).convert("RGB")
+
+        pixel_values = [image_transforms(image) for image in pixel_values]
+        pixel_values = torch.stack(pixel_values)
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+        conditioning_images = [conditioning_image_transforms(image) for image in conditioning_images]
+        conditioning_pixel_values = torch.stack(conditioning_images)
+        conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
+
+        input_ids = torch.stack([example["input_ids"] for example in examples])
+
+        return {
+            "pixel_values": pixel_values,
+            "conditioning_pixel_values": conditioning_pixel_values,
+            "input_ids": input_ids,
+        }
+
+    return collate_fn
 
 
 def main(args):
@@ -838,6 +908,7 @@ def main(args):
         set_seed(args.seed)
 
     # Handle the repository creation
+    repo_id = None
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
@@ -857,6 +928,8 @@ def main(args):
             revision=args.revision,
             use_fast=False,
         )
+    else:
+        raise ValueError("Specify either `--tokenizer_name` or `--pretrained_model_name_or_path`")
 
     # import correct text encoder class
     text_encoder_cls = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, args.revision)
@@ -919,7 +992,7 @@ def main(args):
 
             xformers_version = version.parse(xformers.__version__)
             if xformers_version == version.parse("0.0.16"):
-                logger.warn(
+                logger.warning(
                     "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
                 )
             unet.enable_xformers_memory_efficient_attention()
@@ -979,7 +1052,7 @@ def main(args):
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=True,
-        collate_fn=collate_fn,
+        collate_fn=build_collate_fn(args),
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
@@ -1031,9 +1104,9 @@ def main(args):
         tracker_config = dict(vars(args))
 
         # tensorboard cannot handle list types for config
-        tracker_config.pop("validation_prompt")
-        tracker_config.pop("validation_image")
-        tracker_config.pop("validation_inpainting_image")
+        tracker_config.pop("validation_prompt", None)
+        tracker_config.pop("validation_image", None)
+        tracker_config.pop("validation_inpainting_image", None)
 
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
@@ -1087,7 +1160,12 @@ def main(args):
     )
 
     image_logs = None
+    # `training_done` replaces a bare `break` that only left the inner loop, so
+    # the outer loop ran one extra batch for every remaining epoch.
+    training_done = False
     for epoch in range(first_epoch, args.num_train_epochs):
+        if training_done:
+            break
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
                 # Convert images to latent space
@@ -1195,6 +1273,7 @@ def main(args):
             accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
+                training_done = True
                 break
 
     # Create the pipeline using using the trained modules and save it.
@@ -1206,9 +1285,9 @@ def main(args):
         if args.push_to_hub:
             save_model_card(
                 repo_id,
-                image_logs=image_logs,
                 base_model=args.pretrained_model_name_or_path,
                 repo_folder=args.output_dir,
+                image_logs=image_logs,
             )
             upload_folder(
                 repo_id=repo_id,
@@ -1221,5 +1300,4 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args)
+    main(parse_args())
