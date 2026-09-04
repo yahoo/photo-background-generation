@@ -727,7 +727,6 @@ def prepare_mask_and_masked_image(image, mask):
     mask = mask[None, None]
     mask[mask < 0.5] = 0
     mask[mask >= 0.5] = 1
-    #mask = torch.from_numpy(mask)
 
     masked_image = image * (mask < 0.5)
 
@@ -800,30 +799,12 @@ def collate_fn(examples):
     conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
 
     input_ids = torch.stack([example["input_ids"] for example in examples])
-
- #   masks = torch.stack(masks)
- #   masked_images = torch.stack(masked_images)
-
+    
     return {
         "pixel_values": pixel_values,
         "conditioning_pixel_values": conditioning_pixel_values,
         "input_ids": input_ids,
-  #      "masks": masks, "masked_images": masked_images
     }
-
-#    pixel_values = torch.stack([example["pixel_values"] for example in examples])
-#    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-#    conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
-#    conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
-
- #   input_ids = torch.stack([example["input_ids"] for example in examples])
-
-  #  return {
-  #      "pixel_values": pixel_values,
-  #      "conditioning_pixel_values": conditioning_pixel_values,
-  #      "input_ids": input_ids,
-  #  }
 
 
 def main(args):
